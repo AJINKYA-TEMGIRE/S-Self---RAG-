@@ -14,21 +14,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-llm = ChatGroq(model = "openai/gpt-oss-120b")
+# llm = ChatGroq(model = "openai/gpt-oss-120b")
 emb = HuggingFaceEmbeddings(model_name = "sentence-transformers/all-MiniLM-L6-v2")
 
-flag = True # currently
+flag = False # currently
 
 if flag == False:
     documents = (
-        PyPDFLoader("./Books/book1.pdf").load()
-        + PyPDFLoader("./Books/book2.pdf").load()
-        + PyPDFLoader("./Books/book3.pdf").load()
+        PyPDFLoader("./Documents/2310.11511v1.pdf").load()
+        + PyPDFLoader("./Documents/2401.15884v3.pdf").load()
     )
 
-    chunks = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=150).split_documents(documents)
-    for d in chunks:
-        d.page_content = d.page_content.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    chunks = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=150).split_documents(documents)
 
     vectordatabase = FAISS.from_documents(chunks , emb)
     vectordatabase.save_local("faiss_index_database")
