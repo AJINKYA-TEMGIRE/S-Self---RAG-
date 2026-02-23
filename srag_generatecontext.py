@@ -100,7 +100,36 @@ def good_documents(state: State) -> State:
             good_docs.append(d)
 
     return {"good_docs" : good_docs}
-    
+
+def generate_from_context(state: State) -> State:
+    question = state["question"]
+
+    context = "\n\n".join([d.page_content for d in state["good_docs"]])
+
+    context_generation_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "Answer the question using only retrieved context.\n"
+        ),
+        ("human", "question : {question} , context : {context}"),
+    ]
+    )
+
+    chain = context_generation_prompt | llm
+    out = chain.invoke({"question" : question , "context" : context})
+    return {
+        "answer": out.content
+    }
+
+def no_relevance_docs(state :State) -> State:
+    return {"answer" : "There are no revelant documents to answer the specific question"}
+
+def relevance_docs_to_generate(state: State):
+    if state["good_docs"] and len(state["good_docs"]) > 0:
+        return "generate_from_context"
+    else:
+        return "no_relevance_docs"
 
 def generate_direct(state: State) -> State:
     direct_generation_prompt = ChatPromptTemplate.from_messages(
@@ -137,6 +166,8 @@ graph.add_node("need_retrieval" , need_retrieval)
 graph.add_node("generate_direct" , generate_direct)
 graph.add_node("retrieve_node" , retrieve_node)
 graph.add_node("good_documents" , good_documents)
+graph.add_node("no_relevance_docs" , no_relevance_docs)
+graph.add_node("generate_from_context" , generate_from_context)
 
 graph.add_edge(START , "need_retrieval")
 graph.add_conditional_edges("need_retrieval" ,
@@ -145,12 +176,17 @@ graph.add_conditional_edges("need_retrieval" ,
                             "generate_direct","generate_direct"})
 graph.add_edge("generate_direct" , END)
 graph.add_edge("retrieve_node" , "good_documents")
-graph.add_edge("good_documents" , END)
+graph.add_conditional_edges("good_documents",
+                            relevance_docs_to_generate,
+                            {"no_relevance_docs" , "no_relevance_docs",
+                            "generate_from_context" , "generate_from_context"})
+graph.add_edge("generate_from_context" , END)
+graph.add_edge("no_relevance_docs" , END)
 
 workflow = graph.compile()
 
 answer = workflow.invoke(
-    {"question" : "WHat is working of the Corrective Rag?",
+    {"question" : "Explain about the Self Attention",
      "docs" : [],
      "answer" : "",
      "to_retrieve" : "",
