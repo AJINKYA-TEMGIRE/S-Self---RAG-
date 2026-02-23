@@ -42,6 +42,7 @@ class State(TypedDict):
     to_retrieve : bool
     docs : List[Document]
     answer : str
+    good_docs : List[Document]
 
 def need_retrieval(state : State) -> State:
 
@@ -73,6 +74,34 @@ def retrieve_node(state: State) -> State:
     q = state["question"]
     return {"docs": retriever.invoke(q)}
 
+def good_documents(state: State) -> State:
+    class is_relevant(BaseModel):
+        is_good : bool
+    relevant_docs_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a great Document evaluator.\n"
+            "You will receive one question and one Document.\n"
+            "You have to tell whether that Document is helping to answer the question given.\n"
+            "If the Document is useful then give is_good=True\n"
+            "Otherwise is_good=False\n"
+            "Give answer in given format only."
+        ),
+        ("human", "question : {question} , Document : {document}") ,
+    ]
+    )
+    chain = relevant_docs_prompt | llm.with_structured_output(is_relevant)
+    good_docs = []
+    docs = state["docs"]
+    for d in docs:
+        r = chain.invoke({"question" : state["question"] , "document" : d})
+        if r.is_good:
+            good_docs.append(d)
+
+    return {"good_docs" : good_docs}
+    
+
 def generate_direct(state: State) -> State:
     direct_generation_prompt = ChatPromptTemplate.from_messages(
     [
@@ -85,7 +114,7 @@ def generate_direct(state: State) -> State:
         ),
         ("human", "{question}"),
     ]
-)
+    )
 
     out = llm.invoke(
         direct_generation_prompt.format_messages(
@@ -107,6 +136,7 @@ graph = StateGraph(State)
 graph.add_node("need_retrieval" , need_retrieval)
 graph.add_node("generate_direct" , generate_direct)
 graph.add_node("retrieve_node" , retrieve_node)
+graph.add_node("good_documents" , good_documents)
 
 graph.add_edge(START , "need_retrieval")
 graph.add_conditional_edges("need_retrieval" ,
@@ -114,19 +144,22 @@ graph.add_conditional_edges("need_retrieval" ,
                            {"retrieve_node" , "retrieve_node",
                             "generate_direct","generate_direct"})
 graph.add_edge("generate_direct" , END)
-graph.add_edge("retrieve_node" , END)
+graph.add_edge("retrieve_node" , "good_documents")
+graph.add_edge("good_documents" , END)
 
 workflow = graph.compile()
 
 answer = workflow.invoke(
-    {"question" : "Tell me what is self attention?",
+    {"question" : "WHat is working of the Corrective Rag?",
      "docs" : [],
      "answer" : "",
-     "to_retrieve" : ""}
+     "to_retrieve" : "",
+     "good_docs" : []}
 )
 
 print(answer["to_retrieve"])
-print(answer["docs"])
+print(len(answer["docs"]))
+print(len(answer["good_docs"]))
 print(answer["answer"])
 
 
