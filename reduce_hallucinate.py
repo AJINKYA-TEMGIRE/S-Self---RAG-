@@ -1,5 +1,4 @@
-from typing import List, TypedDict , Literal
-import re
+from typing import List, TypedDict, Literal
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
@@ -9,226 +8,272 @@ from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel
-from langchain_community.tools.tavily_search import TavilySearchResults
 from dotenv import load_dotenv
 
 load_dotenv()
 
-llm = ChatGroq(model = "openai/gpt-oss-120b")
-emb = HuggingFaceEmbeddings(model_name = "sentence-transformers/all-MiniLM-L6-v2")
+llm = ChatGroq(model="openai/gpt-oss-120b")
+emb = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-flag = True # currently
+database = FAISS.load_local(
+    "faiss_index_database",
+    emb,
+    allow_dangerous_deserialization=True
+)
 
-if flag == False:
-    documents = (
-        PyPDFLoader("./Documents/2310.11511v1.pdf").load()
-        + PyPDFLoader("./Documents/2401.15884v3.pdf").load()
-    )
-
-    chunks = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=150).split_documents(documents)
-
-    vectordatabase = FAISS.from_documents(chunks , emb)
-    vectordatabase.save_local("faiss_index_database")
-
-
-database = FAISS.load_local("faiss_index_database" , emb , allow_dangerous_deserialization=True)
 retriever = database.as_retriever(
-    search_type = "similarity",
-    search_kwargs = {"k" : 5}
+    search_type="similarity",
+    search_kwargs={"k": 5}
 )
 
 class State(TypedDict):
-    question : str
-    to_retrieve : bool
-    docs : List[Document]
-    answer : str
-    good_docs : List[Document]
-    context : str
-    is_supported : Literal["Fully Supported" , "Partially Supported" , "Not Supported"]
+    question: str
+    to_retrieve: bool
+    docs: List[Document]
+    answer: str
+    good_docs: List[Document]
+    context: str
+    is_supported: Literal["Fully Supported", "Partially Supported", "Not Supported"]
 
-def need_retrieval(state : State) -> State:
+# ---------------- RETRIEVAL DECISION ---------------- #
 
-    class retrievellm(BaseModel):
-        need : bool
-    
-    eval_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are a strict evaluator.\n"
-            "You will be given one question.\n"
-            "You have to check if that question's answer is in your information or not \n"
-            "If the user is asking related to Self Rag or Corrective Rag related things then you have to compulsory return need:True\n"
-            "Otherwise you need to return need:False\n"
-            "Output JSON only.",
-        ),
-        ("human", "Question: {question}"),
-    ])
+def need_retrieval(state: State) -> State:
 
-    chain = eval_prompt | llm.with_structured_output(retrievellm)
+    class RetrievalDecision(BaseModel):
+        need: bool
 
-    result = chain.invoke({"question" : state["question"]})
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a strict routing classifier.\n"
+                "Your job is to decide whether the question requires document retrieval.\n\n"
+                "Return need=True if:\n"
+                "- The question asks about specific research papers\n"
+                "- The question refers to Self-RAG, Corrective-RAG, or RAG variants\n"
+                "- The question requires specific factual grounding\n\n"
+                "Return need=False if:\n"
+                "- The question can be answered using general knowledge\n\n"
+                "Output JSON only."
+            ),
+            ("human", "Question: {question}")
+        ]
+    )
 
-    return {"to_retrieve" :  result.need}
+    chain = prompt | llm.with_structured_output(RetrievalDecision)
+    result = chain.invoke({"question": state["question"]})
 
+    return {"to_retrieve": result.need}
+
+# ---------------- RETRIEVE ---------------- #
 
 def retrieve_node(state: State) -> State:
-    q = state["question"]
-    return {"docs": retriever.invoke(q)}
+    docs = retriever.invoke(state["question"])
+    return {"docs": docs}
+
+# ---------------- FILTER GOOD DOCS ---------------- #
 
 def good_documents(state: State) -> State:
-    class is_relevant(BaseModel):
-        is_good : bool
-    relevant_docs_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are a great Document evaluator.\n"
-            "You will receive one question and one Document.\n"
-            "You have to tell whether that Document is helping to answer the question given.\n"
-            "If the Document is useful then give is_good=True\n"
-            "Otherwise is_good=False\n"
-            "Give answer in given format only."
-        ),
-        ("human", "question : {question} , Document : {document}") ,
-    ]
+
+    class Relevance(BaseModel):
+        is_good: bool
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a strict document relevance evaluator.\n"
+                "A document is relevant ONLY if it directly contains information\n"
+                "that helps answer the question.\n"
+                "If it only mentions related concepts but does not help answer,\n"
+                "return is_good=False.\n"
+                "Be very strict.\n"
+                "Output JSON only."
+            ),
+            ("human", "Question: {question}\n\nDocument:\n{document}")
+        ]
     )
-    chain = relevant_docs_prompt | llm.with_structured_output(is_relevant)
+
+    chain = prompt | llm.with_structured_output(Relevance)
+
     good_docs = []
-    docs = state["docs"]
-    for d in docs:
-        r = chain.invoke({"question" : state["question"] , "document" : d.page_content})
-        if r.is_good:
+
+    for d in state["docs"]:
+        result = chain.invoke(
+            {"question": state["question"], "document": d.page_content}
+        )
+        if result.is_good:
             good_docs.append(d)
 
-    return {"good_docs" : good_docs}
+    return {"good_docs": good_docs}
+
+# ---------------- GENERATE FROM CONTEXT ---------------- #
 
 def generate_from_context(state: State) -> State:
-    question = state["question"]
 
     context = "\n\n".join([d.page_content for d in state["good_docs"]])
 
-    context_generation_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "Answer the question using only retrieved context.\n"
-        ),
-        ("human", "question : {question} , context : {context}"),
-    ]
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You must answer ONLY using the provided context.\n"
+                "Do NOT add outside knowledge.\n"
+                "If the context is insufficient, say:\n"
+                "'The context does not contain enough information.'"
+            ),
+            ("human", "Question: {question}\n\nContext:\n{context}")
+        ]
     )
 
-    chain = context_generation_prompt | llm
-    out = chain.invoke({"question" : question , "context" : context})
+    chain = prompt | llm
+    out = chain.invoke(
+        {"question": state["question"], "context": context}
+    )
+
     return {
         "answer": out.content,
-        "context" : context
+        "context": context
     }
 
-def no_relevance_docs(state :State) -> State:
-    return {"answer" : "There are no revelant documents to answer the specific question"}
+# ---------------- NO RELEVANT DOCS ---------------- #
+
+def no_relevance_docs(state: State) -> State:
+    return {
+        "answer": "No relevant documents found to answer this question.",
+        "context": ""
+    }
 
 def relevance_docs_to_generate(state: State):
-    if state["good_docs"] and len(state["good_docs"]) > 0:
+    if state["good_docs"]:
         return "generate_from_context"
     else:
         return "no_relevance_docs"
-    
-def check_answer_relevance(state: State) -> State:
-    class relevance(BaseModel):
-        issup : Literal["Fully Supported" , "Partially Supported" , "Not Supported"]
 
-    check_relevance_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are a strict evaluator\n"
-            "You will recieve the question, context retrieved and the answer\n"
-            "If the facts in the answer are completely from the context then you have to return issup: Fully Supported\n"
-            "If the facts in the answer are partially from the context and some facts are generated by model itself then return issup: Partially Supported\n"
-            "Other wise return issup: Not Supported "
-            "Make sure the evaluation is strict as this is for reducing the hallucinations\n"
-            "Remember to answer in given format only."
-        ),
-        ("human", "question : {question} , context : {context} , answer : {answer}"),
-    ]
+# ---------------- ANSWER SUPPORT CHECK ---------------- #
+
+def check_answer_relevance(state: State) -> State:
+
+    class Support(BaseModel):
+        issup: Literal["Fully Supported", "Partially Supported", "Not Supported"]
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a hallucination detector.\n"
+                "Compare answer with context strictly.\n\n"
+                "Fully Supported → Every factual claim appears in context.\n"
+                "Partially Supported → Some claims appear, others do not.\n"
+                "Not Supported → Claims are not grounded in context.\n\n"
+                "Be extremely strict.\n"
+                "Output JSON only."
+            ),
+            (
+                "human",
+                "Question: {question}\n\nContext:\n{context}\n\nAnswer:\n{answer}"
+            )
+        ]
     )
 
-    chain = check_relevance_prompt | llm.with_structured_output(relevance)
+    chain = prompt | llm.with_structured_output(Support)
 
-    out = chain.invoke({"question" : state["question"] , 
-                  "answer" : state["answer"],
-                  "context" : state["context"]})
-    
-    return {"is_supported" : out.issup}
+    result = chain.invoke(
+        {
+            "question": state["question"],
+            "context": state["context"],
+            "answer": state["answer"]
+        }
+    )
+
+    return {"is_supported": result.issup}
+
+# ---------------- DIRECT GENERATION ---------------- #
 
 def generate_direct(state: State) -> State:
-    direct_generation_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "Answer the question using only your general knowledge.\n"
-            "Do NOT assume access to external documents.\n"
-            "If you are unsure or the answer requires specific sources, say:\n"
-            "'I don't know based on my general knowledge.'"
-        ),
-        ("human", "{question}"),
-    ]
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "Answer using only general knowledge.\n"
+                "If unsure, say:\n"
+                "'I don't know based on my general knowledge.'"
+            ),
+            ("human", "{question}")
+        ]
     )
 
     out = llm.invoke(
-        direct_generation_prompt.format_messages(
-            question=state["question"]
-        )
+        prompt.format_messages(question=state["question"])
     )
-    return {
-        "answer": out.content
-    }
 
-def condition(state: State) -> str:
+    return {"answer": out.content}
+
+# ---------------- ROUTING ---------------- #
+
+def condition(state: State):
     if state["to_retrieve"]:
         return "retrieve_node"
-    else:
-        return "generate_direct"
+    return "generate_direct"
+
+# ---------------- GRAPH ---------------- #
 
 graph = StateGraph(State)
 
-graph.add_node("need_retrieval" , need_retrieval)
-graph.add_node("generate_direct" , generate_direct)
-graph.add_node("retrieve_node" , retrieve_node)
-graph.add_node("good_documents" , good_documents)
-graph.add_node("no_relevance_docs" , no_relevance_docs)
-graph.add_node("generate_from_context" , generate_from_context)
-graph.add_node("check_answer_relevance" , check_answer_relevance)
+graph.add_node("need_retrieval", need_retrieval)
+graph.add_node("generate_direct", generate_direct)
+graph.add_node("retrieve_node", retrieve_node)
+graph.add_node("good_documents", good_documents)
+graph.add_node("generate_from_context", generate_from_context)
+graph.add_node("no_relevance_docs", no_relevance_docs)
+graph.add_node("check_answer_relevance", check_answer_relevance)
 
-graph.add_edge(START , "need_retrieval")
-graph.add_conditional_edges("need_retrieval" ,
-                           condition,
-                           {"retrieve_node" , "retrieve_node",
-                            "generate_direct","generate_direct"})
-graph.add_edge("generate_direct" , END)
-graph.add_edge("retrieve_node" , "good_documents")
-graph.add_conditional_edges("good_documents",
-                            relevance_docs_to_generate,
-                            {"no_relevance_docs" , "no_relevance_docs",
-                            "generate_from_context" , "generate_from_context"})
-graph.add_edge("generate_from_context" , "check_answer_relevance")
-graph.add_edge("check_answer_relevance" , END)
-graph.add_edge("no_relevance_docs" , END)
+graph.add_edge(START, "need_retrieval")
+
+graph.add_conditional_edges(
+    "need_retrieval",
+    condition,
+    {
+        "retrieve_node": "retrieve_node",
+        "generate_direct": "generate_direct"
+    }
+)
+
+graph.add_edge("generate_direct", END)
+graph.add_edge("retrieve_node", "good_documents")
+
+graph.add_conditional_edges(
+    "good_documents",
+    relevance_docs_to_generate,
+    {
+        "generate_from_context": "generate_from_context",
+        "no_relevance_docs": "no_relevance_docs"
+    }
+)
+
+graph.add_edge("generate_from_context", "check_answer_relevance")
+graph.add_edge("check_answer_relevance", END)
+graph.add_edge("no_relevance_docs", END)
 
 workflow = graph.compile()
 
-answer = workflow.invoke(
-    {"question" : "How Corrective Rag is better than others?",
-     "docs" : [],
-     "answer" : "",
-     "to_retrieve" : "",
-     "good_docs" : [],
-     "is_supported" : ""}
+# ---------------- RUN ---------------- #
+
+result = workflow.invoke(
+    {
+        "question": "What is CRAG and what is the name of the person who developed this?",
+        "docs": [],
+        "answer": "",
+        "to_retrieve": False,
+        "good_docs": [],
+        "context": "",
+        "is_supported": "Not Supported"
+    }
 )
 
-print(answer["to_retrieve"])
-print(len(answer["docs"]))
-print(len(answer["good_docs"]))
-print(answer["answer"])
-print(answer["is_supported"])
+print(result["to_retrieve"])
+print(len(result["docs"]))
+print(len(result["good_docs"]))
+print(result["answer"])
+print(result.get("is_supported"))
