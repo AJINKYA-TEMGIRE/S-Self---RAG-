@@ -35,9 +35,9 @@ class State(TypedDict):
     context: str
     retry : int
     is_use : bool
+    rquestion : str
+    r_retry : int
     is_supported: Literal["Fully Supported", "Partially Supported", "Not Supported"]
-
-# ---------------- RETRIEVAL DECISION ---------------- #
 
 def need_retrieval(state: State) -> State:
 
@@ -67,13 +67,16 @@ def need_retrieval(state: State) -> State:
 
     return {"to_retrieve": result.need}
 
-# ---------------- RETRIEVE ---------------- #
+
 
 def retrieve_node(state: State) -> State:
-    docs = retriever.invoke(state["question"])
+    if state["rquestion"] == "":
+        q = state["question"]
+    else:
+        q = state["rquestion"]
+    docs = retriever.invoke(q)
     return {"docs": docs}
 
-# ---------------- FILTER GOOD DOCS ---------------- #
 
 def good_documents(state: State) -> State:
 
@@ -109,7 +112,7 @@ def good_documents(state: State) -> State:
 
     return {"good_docs": good_docs}
 
-# ---------------- GENERATE FROM CONTEXT ---------------- #
+
 
 def generate_from_context(state: State) -> State:
 
@@ -138,7 +141,6 @@ def generate_from_context(state: State) -> State:
         "context": context
     }
 
-# ---------------- NO RELEVANT DOCS ---------------- #
 
 def no_relevance_docs(state: State) -> State:
     return {
@@ -152,7 +154,6 @@ def relevance_docs_to_generate(state: State):
     else:
         return "no_relevance_docs"
 
-# ---------------- ANSWER SUPPORT CHECK ---------------- #
 
 def check_answer_relevance(state: State) -> State:
 
@@ -250,9 +251,9 @@ def is_useful(state: State) -> State:
         [
             (
                 "system",
-                "You are an answer evaluator\n",
-                "You will receive the question and it's answer\n",
-                "If the answer is useful for that specific questions you have to return isuse=True\n",
+                "You are an answer evaluator\n"
+                "You will receive the question and it's answer\n"
+                "If the answer is useful for that specific questions you have to return isuse=True\n"
                 "Otherwise return isuse=False\n"
                 "Be extremely strict.\n"
                 "Output JSON only."
@@ -277,11 +278,32 @@ def is_useful(state: State) -> State:
 def route_to_useful(state: State):
     if state["is_use"]:
         return "accept"
-    else:
+    if state["r_retry"] == 5:
         return "no_relevance_docs"
+    else:
+        return "rewrite_question"
+    
+def rewrite_question(state: State) -> State:
 
+    class RQuestion(BaseModel):
+        rquestion : str = Field(description="The rewritten question which will be better for searching")
 
-# ---------------- DIRECT GENERATION ---------------- #
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are great question generator for retrieving documents from vector store\n"
+                "You will recieve one question and you need to rewrite it in efficient way.\n"
+                "Include the keywords which can be best for retrieving."
+            ),
+            ("human", "question : {question}")
+        ]
+    )
+
+    chain = prompt | llm.with_structured_output(RQuestion)
+    result = chain.invoke({"question" : state["question"]})
+    return {"rquestion": result.rquestion , "r_retry" : state["r_retry"] + 1}
+
 
 def generate_direct(state: State) -> State:
 
@@ -303,14 +325,14 @@ def generate_direct(state: State) -> State:
 
     return {"answer": out.content}
 
-# ---------------- ROUTING ---------------- #
+
 
 def condition(state: State):
     if state["to_retrieve"]:
         return "retrieve_node"
     return "generate_direct"
 
-# ---------------- GRAPH ---------------- #
+
 
 graph = StateGraph(State)
 
@@ -324,6 +346,7 @@ graph.add_node("check_answer_relevance", check_answer_relevance)
 graph.add_node("revise_answer" , revise_answer)
 graph.add_node("accept" , accept)
 graph.add_node("is_useful" , is_useful)
+graph.add_node("rewrite_question" , rewrite_question)
 
 
 graph.add_edge(START, "need_retrieval")
@@ -360,19 +383,19 @@ graph.add_conditional_edges("check_answer_relevance",
 graph.add_conditional_edges("is_useful",
                             route_to_useful,
                             {"accept" : "accept",
-                             "no_relevance_docs" : "no_relevance_docs"})
-graph.add_edge("is_useful", "accept")
+                             "no_relevance_docs" : "no_relevance_docs",
+                             "rewrite_question" : "rewrite_question"})
 graph.add_edge("accept" , END)
 graph.add_edge("no_relevance_docs" , END)
+graph.add_edge("rewrite_question" , "retrieve_node")
 graph.add_edge("revise_answer", "check_answer_relevance")
 
 workflow = graph.compile()
 
-# ---------------- RUN ---------------- #
 
 result = workflow.invoke(
     {
-        "question": "What is CRAG and what is the name of the person who developed this?",
+        "question": "What is Self Rag , How does it work ?",
         "docs": [],
         "answer": "",
         "to_retrieve": False,
@@ -380,7 +403,9 @@ result = workflow.invoke(
         "context": "",
         "is_supported": "Not Supported",
         "retry" : 0,
-        "is_use" : False
+        "is_use" : False,
+        "rquestion" : "",
+        "r_retry" : 0
     }
 )
 
@@ -389,3 +414,6 @@ print(len(result["docs"]))
 print(len(result["good_docs"]))
 print(result["answer"])
 print(result.get("is_supported"))
+print(result["rquestion"])
+print(result["retry"])
+print(result["r_retry"])
